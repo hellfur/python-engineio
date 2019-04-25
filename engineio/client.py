@@ -40,8 +40,8 @@ def signal_handler(sig, frame):
             client.disconnect(abort=True)
     return original_signal_handler(sig, frame)
 
-
-original_signal_handler = signal.signal(signal.SIGINT, signal_handler)
+if threading.main_thread() == threading.current_thread():
+    original_signal_handler = signal.signal(signal.SIGINT, signal_handler)
 
 
 class Client(object):
