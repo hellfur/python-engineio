@@ -5,9 +5,8 @@ import engineio
 
 eio = engineio.AsyncServer(async_mode='asgi')
 app = engineio.ASGIApp(eio, static_files={
-    '/': {'content_type': 'text/html', 'filename': 'simple.html'},
-    '/static/engine.io.js': {'content_type': 'application/javascript',
-                             'filename': 'static/engine.io.js'}
+    '/': 'simple.html',
+    '/static': 'static',
 })
 
 
@@ -28,4 +27,4 @@ def disconnect(sid):
 
 
 if __name__ == '__main__':
-    uvicorn.run(app, '127.0.0.1', 5000)
+    uvicorn.run(app, host='127.0.0.1', port=5000)

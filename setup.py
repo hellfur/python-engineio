@@ -6,7 +6,7 @@ Engine.IO server.
 """
 import re
 import sys
-from setuptools import setup, find_packages
+from setuptools import setup
 
 
 with open('engineio/__init__.py', 'r') as f:
@@ -25,7 +25,7 @@ setup(
     author_email='miguelgrinberg50@gmail.com',
     description='Engine.IO server',
     long_description=long_description,
-    packages=find_packages(),
+    packages=['engineio', 'engineio.async_drivers'],
     zip_safe=False,
     include_package_data=True,
     platforms='any',

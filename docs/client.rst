@@ -83,6 +83,11 @@ In the case of the ``asyncio`` client, the method is a coroutine::
 
     await eio.connect('http://localhost:5000')
 
+Upon connection, the server assigns the client a unique session identifier.
+The applicaction can find this identifier in the ``sid`` attribute::
+
+    print('my sid is', eio.sid)
+
 Sending Messages
 ----------------
 
@@ -157,7 +162,7 @@ Here is the ``asyncio`` version::
 Note that this function is not a coroutine, since it does not wait for the
 background function to end, but the background function is.
 
-The ``sleep()`` method is a second convenince function that is provided for
+The ``sleep()`` method is a second convenience function that is provided for
 the benefit of applications working with background tasks of their own::
 
     eio.sleep(2)

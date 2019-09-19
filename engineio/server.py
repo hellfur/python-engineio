@@ -33,7 +33,11 @@ class Server(object):
                          server to respond before disconnecting. The default
                          is 60 seconds.
     :param ping_interval: The interval in seconds at which the client pings
-                          the server. The default is 25 seconds.
+                          the server. The default is 25 seconds. For advanced
+                          control, a two element tuple can be given, where
+                          the first number is the ping interval and the second
+                          is a grace period added by the server. The default
+                          grace period is 5 seconds.
     :param max_http_buffer_size: The maximum size of a message when using the
                                  polling transport. The default is 100,000,000
                                  bytes.
@@ -48,9 +52,10 @@ class Server(object):
                    id. If set to ``None``, a cookie is not sent to the client.
                    The default is ``'io'``.
     :param cors_allowed_origins: Origin or list of origins that are allowed to
-                                 connect to this server. All origins are
-                                 allowed by default, which is equivalent to
-                                 setting this argument to ``'*'``.
+                                 connect to this server. Only the same origin
+                                 is allowed by default. Set this argument to
+                                 ``'*'`` to allow all origins, or to ``[]`` to
+                                 disable CORS handling.
     :param cors_credentials: Whether credentials (cookies, authentication) are
                              allowed in requests to this server. The default
                              is ``True``.
@@ -82,7 +87,12 @@ class Server(object):
                  cors_credentials=True, logger=False, json=None,
                  async_handlers=True, monitor_clients=None, **kwargs):
         self.ping_timeout = ping_timeout
-        self.ping_interval = ping_interval
+        if isinstance(ping_interval, tuple):
+            self.ping_interval = ping_interval[0]
+            self.ping_interval_grace_period = ping_interval[1]
+        else:
+            self.ping_interval = ping_interval
+            self.ping_interval_grace_period = 5
         self.max_http_buffer_size = max_http_buffer_size
         self.allow_upgrades = allow_upgrades
         self.http_compression = http_compression
@@ -309,68 +319,95 @@ class Server(object):
         This function returns the HTTP response body to deliver to the client
         as a byte sequence.
         """
+        if self.cors_allowed_origins != []:
+            # Validate the origin header if present
+            # This is important for WebSocket more than for HTTP, since
+            # browsers only apply CORS controls to HTTP.
+            origin = environ.get('HTTP_ORIGIN')
+            if origin:
+                allowed_origins = self._cors_allowed_origins(environ)
+                if allowed_origins is not None and origin not in \
+                        allowed_origins:
+                    self.logger.info(origin + ' is not an accepted origin.')
+                    r = self._bad_request()
+                    start_response(r['status'], r['headers'])
+                    return [r['response']]
+
         method = environ['REQUEST_METHOD']
         query = urllib.parse.parse_qs(environ.get('QUERY_STRING', ''))
+
+        sid = query['sid'][0] if 'sid' in query else None
+        b64 = False
+        jsonp = False
+        jsonp_index = None
+
+        if 'b64' in query:
+            if query['b64'][0] == "1" or query['b64'][0].lower() == "true":
+                b64 = True
         if 'j' in query:
-            self.logger.warning('JSONP requests are not supported')
+            jsonp = True
+            try:
+                jsonp_index = int(query['j'][0])
+            except (ValueError, KeyError, IndexError):
+                # Invalid JSONP index number
+                pass
+
+        if jsonp and jsonp_index is None:
+            self.logger.warning('Invalid JSONP index number')
             r = self._bad_request()
-        else:
-            sid = query['sid'][0] if 'sid' in query else None
-            b64 = False
-            if 'b64' in query:
-                if query['b64'][0] == "1" or query['b64'][0].lower() == "true":
-                    b64 = True
-            if method == 'GET':
-                if sid is None:
-                    transport = query.get('transport', ['polling'])[0]
-                    if transport != 'polling' and transport != 'websocket':
-                        self.logger.warning('Invalid transport %s', transport)
-                        r = self._bad_request()
-                    else:
-                        r = self._handle_connect(environ, start_response,
-                                                 transport, b64)
+        elif method == 'GET':
+            if sid is None:
+                transport = query.get('transport', ['polling'])[0]
+                if transport != 'polling' and transport != 'websocket':
+                    self.logger.warning('Invalid transport %s', transport)
+                    r = self._bad_request()
                 else:
-                    if sid not in self.sockets:
-                        self.logger.warning('Invalid session %s', sid)
-                        r = self._bad_request()
-                    else:
-                        socket = self._get_socket(sid)
-                        try:
-                            packets = socket.handle_get_request(
-                                environ, start_response)
-                            if isinstance(packets, list):
-                                r = self._ok(packets, b64=b64)
-                            else:
-                                r = packets
-                        except exceptions.EngineIOError:
-                            if sid in self.sockets:  # pragma: no cover
-                                self.disconnect(sid)
-                            r = self._bad_request()
-                        if sid in self.sockets and self.sockets[sid].closed:
-                            del self.sockets[sid]
-            elif method == 'POST':
-                if sid is None or sid not in self.sockets:
+                    r = self._handle_connect(environ, start_response,
+                                             transport, b64, jsonp_index)
+            else:
+                if sid not in self.sockets:
                     self.logger.warning('Invalid session %s', sid)
                     r = self._bad_request()
                 else:
                     socket = self._get_socket(sid)
                     try:
-                        socket.handle_post_request(environ)
-                        r = self._ok()
+                        packets = socket.handle_get_request(
+                            environ, start_response)
+                        if isinstance(packets, list):
+                            r = self._ok(packets, b64=b64,
+                                         jsonp_index=jsonp_index)
+                        else:
+                            r = packets
                     except exceptions.EngineIOError:
                         if sid in self.sockets:  # pragma: no cover
                             self.disconnect(sid)
                         r = self._bad_request()
-                    except:  # pragma: no cover
-                        # for any other unexpected errors, we log the error
-                        # and keep going
-                        self.logger.exception('post request handler error')
-                        r = self._ok()
-            elif method == 'OPTIONS':
-                r = self._ok()
+                    if sid in self.sockets and self.sockets[sid].closed:
+                        del self.sockets[sid]
+        elif method == 'POST':
+            if sid is None or sid not in self.sockets:
+                self.logger.warning('Invalid session %s', sid)
+                r = self._bad_request()
             else:
-                self.logger.warning('Method %s not supported', method)
-                r = self._method_not_found()
+                socket = self._get_socket(sid)
+                try:
+                    socket.handle_post_request(environ)
+                    r = self._ok(jsonp_index=jsonp_index)
+                except exceptions.EngineIOError:
+                    if sid in self.sockets:  # pragma: no cover
+                        self.disconnect(sid)
+                    r = self._bad_request()
+                except:  # pragma: no cover
+                    # for any other unexpected errors, we log the error
+                    # and keep going
+                    self.logger.exception('post request handler error')
+                    r = self._ok(jsonp_index=jsonp_index)
+        elif method == 'OPTIONS':
+            r = self._ok()
+        else:
+            self.logger.warning('Method %s not supported', method)
+            r = self._method_not_found()
+
         if not isinstance(r, dict):
             return r or []
         if self.http_compression and \
@@ -447,7 +484,8 @@ class Server(object):
         """Generate a unique session id."""
         return uuid.uuid4().hex
 
-    def _handle_connect(self, environ, start_response, transport, b64=False):
+    def _handle_connect(self, environ, start_response, transport, b64=False,
+                        jsonp_index=None):
         """Handle a client connection request."""
         if self.start_service_task:
             # start the service task to monitor connected clients
@@ -483,7 +521,8 @@ class Server(object):
             if self.cookie:
                 headers = [('Set-Cookie', self.cookie + '=' + sid)]
             try:
-                return self._ok(s.poll(), headers=headers, b64=b64)
+                return self._ok(s.poll(), headers=headers, b64=b64,
+                                jsonp_index=jsonp_index)
             except exceptions.QueueEmpty:
                 return self._bad_request()
 
@@ -521,7 +560,7 @@ class Server(object):
             raise KeyError('Session is disconnected')
         return s
 
-    def _ok(self, packets=None, headers=None, b64=False):
+    def _ok(self, packets=None, headers=None, b64=False, jsonp_index=None):
         """Generate a successful HTTP response."""
         if packets is not None:
             if headers is None:
@@ -532,7 +571,8 @@ class Server(object):
                 headers += [('Content-Type', 'application/octet-stream')]
             return {'status': '200 OK',
                     'headers': headers,
-                    'response': payload.Payload(packets=packets).encode(b64)}
+                    'response': payload.Payload(packets=packets).encode(
+                        b64=b64, jsonp_index=jsonp_index)}
         else:
             return {'status': '200 OK',
                     'headers': [('Content-Type', 'text/plain')],
@@ -556,27 +596,38 @@ class Server(object):
                 'headers': [('Content-Type', 'text/plain')],
                 'response': b'Unauthorized'}
 
-    def _cors_headers(self, environ):
-        """Return the cross-origin-resource-sharing headers."""
-        if isinstance(self.cors_allowed_origins, six.string_types):
-            if self.cors_allowed_origins == '*':
-                allowed_origins = None
-            else:
-                allowed_origins = [self.cors_allowed_origins]
+    def _cors_allowed_origins(self, environ):
+        default_origin = None
+        if 'wsgi.url_scheme' in environ and 'HTTP_HOST' in environ:
+            default_origin = '{scheme}://{host}'.format(
+                scheme=environ['wsgi.url_scheme'], host=environ['HTTP_HOST'])
+        if self.cors_allowed_origins is None:
+            allowed_origins = [default_origin] \
+                if default_origin is not None else []
+        elif self.cors_allowed_origins == '*':
+            allowed_origins = None
+        elif isinstance(self.cors_allowed_origins, six.string_types):
+            allowed_origins = [self.cors_allowed_origins]
         else:
             allowed_origins = self.cors_allowed_origins
-        if allowed_origins is not None and \
-                environ.get('HTTP_ORIGIN', '') not in allowed_origins:
+        return allowed_origins
+
+    def _cors_headers(self, environ):
+        """Return the cross-origin-resource-sharing headers."""
+        if self.cors_allowed_origins == []:
+            # special case, CORS handling is completely disabled
             return []
-        if 'HTTP_ORIGIN' in environ:
+        headers = []
+        allowed_origins = self._cors_allowed_origins(environ)
+        if 'HTTP_ORIGIN' in environ and \
+                (allowed_origins is None or environ['HTTP_ORIGIN'] in
+                 allowed_origins):
             headers = [('Access-Control-Allow-Origin', environ['HTTP_ORIGIN'])]
-        else:
-            headers = [('Access-Control-Allow-Origin', '*')]
         if environ['REQUEST_METHOD'] == 'OPTIONS':
             headers += [('Access-Control-Allow-Methods', 'OPTIONS, GET, POST')]
         if 'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' in environ:
             headers += [('Access-Control-Allow-Headers',
-                         environ['HTTP_ACCESS_CONTROL_REQUEST_HEADERS'])]
+                        environ['HTTP_ACCESS_CONTROL_REQUEST_HEADERS'])]
         if self.cors_credentials:
             headers += [('Access-Control-Allow-Credentials', 'true')]
         return headers
